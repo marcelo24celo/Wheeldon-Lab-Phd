@@ -1,0 +1,431 @@
+### Code created entirely by Clifford S. Morrison, Recieved latest version of code on 5/6/25
+import csv
+import itertools
+from Bio import SeqIO
+from Bio.Seq import Seq
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+
+# -------------------------------
+# Debug mode settings
+# -------------------------------
+debug_mode = False
+debug_limit = 500  # Process only the first 500 qualifying reads in debug mode
+
+# -------------------------------
+# Parameters for anchoring and regulatory search
+# -------------------------------
+upstream_window = 100  # Look 100 bp upstream of the gene anchor
+anchor_tolerance = 20   # Tolerance for gene anchor matching (number of mismatches allowed)
+regulatory_tolerance = 2  # Allow up to 2 mismatches for regulatory parts
+
+# -------------------------------
+# Provide the gene anchor sequences directly (as determined from your reference)
+# -------------------------------
+gene1_anchor_seq = "atgaacacgattaacatcgctaagaacgacttctctgacatcgaactggc"  # Example for gene1
+gene2_anchor_seq = "atgccatcggaacttacaccggaggaaaggtccgagttgaagaacagcat"  # Example for gene2
+gene3_anchor_seq = "atgcgtaaaggcgaagagctgttcactggtgtcgtccctattctggtgga"   # Example for gene3
+
+# Store anchors in a dictionary for convenience.
+gene_anchor_dict = {
+    "gene1": gene1_anchor_seq,
+    "gene2": gene2_anchor_seq,
+    "gene3": gene3_anchor_seq,
+}
+
+# -------------------------------
+# Regulatory variant dictionaries (exact sequences)
+# -------------------------------
+promoters = {
+    "J23100": "ttgacggctagctcagtcctaggtacagtgctagc", 
+    "J23101": "tttacagctagctcagtcctaggtattatgctagc",
+    "J23151": "tgctgttccgctgggcatgcttgatggctagctcagtcctaggtacaatgc",
+    "J23116": "ttgacagctagctcagtcctagggactatgctagc",
+    "J23103": "ctgatagctagctcagtcctagggattatgctagc"
+}
+
+rbs = {
+    "B0034m": "agagaaagaggagaaatacta",
+    "B0032m": "agagtcacacaggaaagtacta",
+    "B0033m": "agagtcacacaggactacta",
+}
+
+# -------------------------------
+# Expected regulatory parts in the upstream windows
+# -------------------------------
+# For gene1 and gene2, we expect a promoter followed by an RBS.
+# For gene3, we expect only an RBS.
+expected_gene_parts = {
+    "gene1": ["promoter", "rbs"],
+    "gene2": ["promoter", "rbs"],
+    "gene3": ["rbs"]
+}
+
+# -------------------------------
+# Helper function: Hamming distance
+# -------------------------------
+def hamming_distance(s1, s2):
+    """Return the number of mismatches between two strings (assumes equal length)."""
+    if len(s1) != len(s2):
+        return None
+    return sum(c1 != c2 for c1, c2 in zip(s1, s2))
+
+# -------------------------------
+# Helper function: Approximate occurrence in a window
+# -------------------------------
+def find_occurrence_approx(window, pattern, start, tol):
+    """
+    Slide a window of length len(pattern) across 'window' starting at index 'start'.
+    Return a tuple (index, mismatches) for the earliest occurrence where the Hamming distance
+    between window substring and pattern is <= tol. If none is found, return (-1, None).
+    """
+    L = len(pattern)
+    for i in range(start, len(window) - L + 1):
+        candidate = window[i:i+L]
+        d = hamming_distance(candidate, pattern)
+        if d is not None and d <= tol:
+            return i, d
+    return -1, None
+
+# -------------------------------
+# Function: Process upstream window for a gene using approximate matching for regulatory parts
+# -------------------------------
+def process_gene_window(read_seq, gene_anchor_pos, expected_parts, window_size, tol=regulatory_tolerance):
+    """
+    Extract a window upstream of the gene anchor (from max(0, pos-window_size) to pos)
+    and search it sequentially for the expected regulatory parts using approximate matching.
+    Returns a tuple (assignment, error_message), where assignment is a dict mapping,
+    e.g. "promoter" -> variant.
+    """
+    start_win = max(0, gene_anchor_pos - window_size)
+    window = read_seq[start_win:gene_anchor_pos]
+    pos = 0
+    assignment = {}
+    for part in expected_parts:
+        if part == "promoter":
+            best_variant = None
+            best_index = None
+            for variant, vseq in promoters.items():
+                idx, d = find_occurrence_approx(window, vseq, pos, tol)
+                if idx != -1:
+                    if best_index is None or idx < best_index:
+                        best_index = idx
+                        best_variant = variant
+            if best_variant is None:
+                return None, f"Could not find {part} in window (length {len(window)}) starting at pos {pos}"
+            assignment[part] = best_variant
+            pos = best_index + len(promoters[best_variant])
+        elif part == "rbs":
+            best_variant = None
+            best_index = None
+            for variant, vseq in rbs.items():
+                idx, d = find_occurrence_approx(window, vseq, pos, tol)
+                if idx != -1:
+                    if best_index is None or idx < best_index:
+                        best_index = idx
+                        best_variant = variant
+            if best_variant is None:
+                return None, f"Could not find {part} in window (length {len(window)}) starting at pos {pos}"
+            assignment[part] = best_variant
+            pos = best_index + len(rbs[best_variant])
+    return assignment, ""
+
+# -------------------------------
+# Function: Find gene anchor in a read by approximate matching (for anchors)
+# -------------------------------
+def find_anchor_in_read(seq, anchor_seq, tol):
+    """
+    Slide a window of length len(anchor_seq) across seq.
+    Return the earliest index i for which the Hamming distance between seq[i:i+L]
+    and anchor_seq is <= tol. If none is found, return -1.
+    """
+    L = len(anchor_seq)
+    for i in range(0, len(seq) - L + 1):
+        candidate = seq[i:i+L]
+        d = hamming_distance(candidate, anchor_seq)
+        if d is not None and d <= tol:
+            return i
+    return -1
+
+# -------------------------------
+# Process read by anchoring using approximate matching for gene anchors and upstream windows for parts
+# -------------------------------
+def process_read_by_anchoring(seq, window_size=upstream_window):
+    """
+    Process a read by first searching for gene anchors (gene1, gene2, gene3)
+    using approximate matching with a fixed tolerance (anchor_tolerance), then extracting a fixed-size
+    upstream window for each gene and searching that window for the expected regulatory parts.
+    Returns a tuple (combo, error_message), where combo is:
+      (gene1_promoter, gene1_RBS, gene2_promoter, gene2_RBS, gene3_RBS)
+    """
+    seq = seq.lower()
+    pos_gene1 = find_anchor_in_read(seq, gene_anchor_dict.get("gene1", ""), anchor_tolerance)
+    pos_gene2 = find_anchor_in_read(seq, gene_anchor_dict.get("gene2", ""), anchor_tolerance)
+    pos_gene3 = find_anchor_in_read(seq, gene_anchor_dict.get("gene3", ""), anchor_tolerance)
+    
+    if pos_gene1 == -1 or pos_gene2 == -1 or pos_gene3 == -1:
+        return None, "Missing one or more gene anchors in read"
+    if not (pos_gene1 < pos_gene2 < pos_gene3):
+        return None, "Gene anchors not in expected order"
+    
+    assign1, err1 = process_gene_window(seq, pos_gene1, expected_gene_parts["gene1"], window_size, regulatory_tolerance)
+    if assign1 is None:
+        return None, f"Gene1 window error: {err1}"
+    assign2, err2 = process_gene_window(seq, pos_gene2, expected_gene_parts["gene2"], window_size, regulatory_tolerance)
+    if assign2 is None:
+        return None, f"Gene2 window error: {err2}"
+    assign3, err3 = process_gene_window(seq, pos_gene3, expected_gene_parts["gene3"], window_size, regulatory_tolerance)
+    if assign3 is None:
+        return None, f"Gene3 window error: {err3}"
+    
+    combo = (assign1["promoter"], assign1["rbs"],
+             assign2["promoter"], assign2["rbs"],
+             assign3["rbs"])
+    return combo, ""
+
+def process_read_by_anchoring_with_orientation(seq, window_size=upstream_window):
+    """
+    Try processing the read using the anchoring approach in the forward orientation.
+    If unsuccessful, try the reverse complement.
+    Returns a tuple (combo, error_message).
+    """
+    combo, reason = process_read_by_anchoring(seq, window_size)
+    if combo is not None:
+        return combo, ""
+    rev_seq = str(Seq(seq).reverse_complement()).lower()
+    combo_rev, reason_rev = process_read_by_anchoring(rev_seq, window_size)
+    if combo_rev is not None:
+        return combo_rev, ""
+    return None, f"Forward error: {reason} | Reverse error: {reason_rev}"
+
+# -------------------------------
+# Generate All Possible Constructs (675 total)
+# -------------------------------
+gene1_promoters = list(promoters.keys())
+gene1_rbs = list(rbs.keys())
+gene2_promoters = list(promoters.keys())
+gene2_rbs = list(rbs.keys())
+gene3_rbs = list(rbs.keys())
+all_combinations = list(itertools.product(gene1_promoters, gene1_rbs,
+                                          gene2_promoters, gene2_rbs,
+                                          gene3_rbs))
+combo_to_id = {combo: i for i, combo in enumerate(all_combinations, start=1)}
+construct_counts = {combo: 0 for combo in all_combinations}
+construct_reads = {combo: [] for combo in all_combinations}
+
+# -------------------------------
+# Process FASTQ Reads Using Anchoring with Orientation
+# -------------------------------
+fastq_file = "YG8NX6_1_MC005.fastq"  # UPDATE with your FASTQ file path
+assigned_count = 0
+unassigned_reads = []  # List of tuples: (read_id, sequence, error_reason)
+total_reads_counter = 0
+qualifying_reads_processed = 0
+
+pbar = tqdm(SeqIO.parse(fastq_file, "fastq"), desc="Processing reads", unit="read")
+for record in pbar:
+    total_reads_counter += 1
+    pbar.set_postfix(total=total_reads_counter, qual=qualifying_reads_processed)
+    if len(record.seq) < 4000 or len(record.seq) > 7000:
+        continue
+    qualifying_reads_processed += 1
+    if debug_mode and qualifying_reads_processed > debug_limit:
+        break
+    seq = str(record.seq)
+    combo, reason = process_read_by_anchoring_with_orientation(seq, window_size=upstream_window)
+    if combo is not None:
+        construct_counts[combo] += 1
+        construct_reads[combo].append((record.id, seq))
+        assigned_count += 1
+    else:
+        unassigned_reads.append((record.id, seq, reason))
+
+print(f"Total qualifying reads processed: {qualifying_reads_processed}")
+print(f"Assigned reads: {assigned_count}")
+print(f"Unassigned reads: {len(unassigned_reads)}")
+
+# -------------------------------
+# Write CSV File with Construct Counts
+# -------------------------------
+csv_filename = "construct_counts.csv"
+with open(csv_filename, "w", newline="") as csvfile:
+    csv_writer = csv.writer(csvfile)
+    header = ["Construct_ID", "gene1_promoter", "gene1_RBS", "gene2_promoter", "gene2_RBS", "gene3_RBS", "Read_Count"]
+    csv_writer.writerow(header)
+    for combo in all_combinations:
+        construct_id = combo_to_id[combo]
+        count = construct_counts.get(combo, 0)
+        row = [construct_id] + list(combo) + [count]
+        csv_writer.writerow(row)
+print(f"CSV file saved as {csv_filename}")
+
+# -------------------------------
+# Write CSV File with Read Details for QC (Assigned Reads)
+# -------------------------------
+qc_csv_filename = "reads_by_construct.csv"
+with open(qc_csv_filename, "w", newline="") as csvfile:
+    csv_writer = csv.writer(csvfile)
+    header = ["Construct_ID", "Read_ID", "Sequence", "gene1_promoter", "gene1_RBS", "gene2_promoter", "gene2_RBS", "gene3_RBS"]
+    csv_writer.writerow(header)
+    for combo, reads in construct_reads.items():
+        construct_id = combo_to_id[combo]
+        for read_id, sequence in reads:
+            row = [construct_id, read_id, sequence] + list(combo)
+            csv_writer.writerow(row)
+print(f"QC CSV file with read details saved as {qc_csv_filename}")
+
+# -------------------------------
+# Write CSV File for Unassigned Reads
+# -------------------------------
+unassigned_csv = "unassigned_reads.csv"
+with open(unassigned_csv, "w", newline="") as csvfile:
+    csv_writer = csv.writer(csvfile)
+    header = ["Read_ID", "Sequence", "Length", "Unassignment_Reason"]
+    csv_writer.writerow(header)
+    for read_id, sequence, reason in unassigned_reads:
+        csv_writer.writerow([read_id, sequence, len(sequence), reason])
+print(f"CSV file with unassigned reads saved as {unassigned_csv}")
+
+# -------------------------------
+# Plotting: Bar Chart Comparing Assigned vs Unassigned Reads
+# -------------------------------
+labels = ["Assigned", "Unassigned"]
+values = [assigned_count, len(unassigned_reads)]
+plt.figure(figsize=(8,6))
+plt.bar(labels, values, color=["green", "red"])
+plt.ylabel("Number of Reads")
+plt.title("Assigned vs Unassigned Reads")
+plt.tight_layout()
+plt.savefig("assigned_vs_unassigned.png")
+plt.show()
+
+# -------------------------------
+# Plotting: Interactive Plot for Constructs (using Plotly)
+# -------------------------------
+df = pd.read_csv("construct_counts.csv")
+df["Construct_Details"] = (
+    "gene1 promoter: " + df["gene1_promoter"] + "/" + df["gene1_RBS"] +
+    "<br>gene2 promoter: " + df["gene2_promoter"] + "/" + df["gene2_RBS"] +
+    "<br>gene3 RBS: " + df["gene3_RBS"]
+)
+fig = px.bar(df, x="Construct_ID", y="Read_Count",
+             custom_data=["Construct_Details"],
+             labels={"Construct_ID": "Construct ID", "Read_Count": "Read Count"},
+             title="Read Counts for Each Construct (675 total)")
+fig.update_traces(hovertemplate=
+    "Construct ID: %{x}<br>" +
+    "Read Count: %{y}<br>" +
+    "%{customdata[0]}<extra></extra>")
+fig.update_layout(xaxis=dict(tickmode="linear", tick0=1, dtick=25))
+fig.write_html("interactive_plot.html")
+fig.show()
+
+#---------------------------------
+# --- Additional Visualization ---
+#---------------------------------
+
+# Read your CSV file with construct counts.
+df = pd.read_csv("construct_counts.csv")
+
+# Define numerical strength values based on your ranking.
+promoter_strengths = {
+    "J23100": 1,
+    "J23101": 0.70,
+    "J23151": 0.34,
+    "J23116": 0.16,
+    "J23103": 0.01
+}
+
+rbs_strengths = {
+    "B0034m": 3,
+    "B0032m": 2,
+    "B0033m": 1
+}
+
+# Map the strength values.
+df["gene1_promoter_strength"] = df["gene1_promoter"].map(promoter_strengths)
+df["gene2_promoter_strength"] = df["gene2_promoter"].map(promoter_strengths)
+df["gene1_RBS_strength"] = df["gene1_RBS"].map(rbs_strengths)
+df["gene2_RBS_strength"] = df["gene2_RBS"].map(rbs_strengths)
+df["gene3_RBS_strength"] = df["gene3_RBS"].map(rbs_strengths)
+
+# Compute aggregate scores.
+df["Total_Promoter_Strength"] = df["gene1_promoter_strength"] + df["gene2_promoter_strength"]
+df["Total_RBS_Strength"] = (df["gene1_RBS_strength"] + 
+                            df["gene2_RBS_strength"] + 
+                            df["gene3_RBS_strength"])
+
+# We'll use the read count as the height (Z).
+# For visualization, set fixed bar widths (you can adjust these).
+dx = 0.05  # width in X (promoter strength dimension)
+dy = 0.05  # width in Y (RBS strength dimension)
+
+def create_bar(x, y, z, dx, dy):
+    """
+    Create a cuboid (3D bar) with base centered at (x, y, 0) and height z.
+    Returns lists of x, y, z coordinates of vertices and the triangle indices (i, j, k).
+    """
+    # Determine the base boundaries:
+    x0 = x - dx/2
+    x1 = x + dx/2
+    y0 = y - dy/2
+    y1 = y + dy/2
+    z0 = 0
+    z1 = z
+
+    # 8 vertices of the cuboid.
+    vertices = [
+        [x0, y0, z0],  # 0
+        [x1, y0, z0],  # 1
+        [x1, y1, z0],  # 2
+        [x0, y1, z0],  # 3
+        [x0, y0, z1],  # 4
+        [x1, y0, z1],  # 5
+        [x1, y1, z1],  # 6
+        [x0, y1, z1]   # 7
+    ]
+    # Define faces as triangles (two per rectangular face)
+    # We'll define the indices for 12 triangles.
+    I = [0, 0, 0, 4, 4, 1, 2, 3, 3, 5, 6, 7]
+    J = [1, 3, 4, 5, 7, 2, 3, 2, 7, 6, 7, 4]
+    K = [3, 4, 5, 7, 1, 3, 0, 6, 6, 7, 4, 5]
+    xs = [v[0] for v in vertices]
+    ys = [v[1] for v in vertices]
+    zs = [v[2] for v in vertices]
+    return xs, ys, zs, I, J, K
+
+bars = []
+# For each construct (each row of the DataFrame), create a 3D bar.
+for index, row in df.iterrows():
+    x = row["Total_Promoter_Strength"]
+    y = row["Total_RBS_Strength"]
+    z = row["Read_Count"]
+    xs, ys, zs, I, J, K = create_bar(x, y, z, dx, dy)
+    bar = go.Mesh3d(
+        x=xs,
+        y=ys,
+        z=zs,
+        i=I,
+        j=J,
+        k=K,
+        opacity=0.8,
+        color="blue",
+        name=f"Construct {row['Construct_ID']}",
+        showscale=False
+    )
+    bars.append(bar)
+
+fig = go.Figure(data=bars)
+fig.update_layout(
+    scene=dict(
+        xaxis_title="Total Promoter Strength",
+        yaxis_title="Total RBS Strength",
+        zaxis_title="Read Count"
+    ),
+    title="3D Histogram of Constructs"
+)
+fig.write_html("3d_histogram_constructs.html")
+fig.show()
