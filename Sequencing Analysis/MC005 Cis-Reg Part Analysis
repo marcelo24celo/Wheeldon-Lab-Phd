@@ -1,4 +1,4 @@
-### Code created entirely by Clifford S. Morrison, Recieved latest version of code on 5/6/25
+### Code created entirely by Dr. Clifford S. Morrison, Received latest version of code on 5/6/25
 import csv
 import itertools
 from Bio import SeqIO
